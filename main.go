@@ -12,23 +12,42 @@ import (
 	"strings"
 )
 
+type arrayFlags []string
+
+func (i *arrayFlags) String() string {
+	return fmt.Sprintf("%#v", *i)
+}
+
+func (i *arrayFlags) Set(value string) error {
+	*i = append(*i, value)
+	return nil
+}
+
 //
 // from: https://github.com/golang/example/tree/master/gotypes#typeandvalue
 //
 // running: go run ./cmd/goerd/main.go -path cmd/traverse/|dot -Tsvg > out.svg
 func main() {
 	var (
-		path = flag.String("path", "", "path parse")
+		//path  = flag.String("path", "", "path parse")
+		paths arrayFlags
 	)
+	flag.Var(&paths, "path", "golang paths to examine")
 
 	flag.Parse()
 
-	if *path == "" {
+	if len(paths) == 0 {
 		flag.Usage()
 		os.Exit(1)
 	}
+	pkgTypes := make(map[string]map[string]namedType)
+	for _, pkg := range paths {
+		for ptname, ptmap := range inspectDir(pkg) {
+			pkgTypes[ptname] = ptmap
+		}
+	}
 
-	dotRender(os.Stdout, inspectDir(*path))
+	dotRender(os.Stdout, pkgTypes)
 }
 
 type namedType struct {
@@ -39,10 +58,20 @@ type namedType struct {
 func dotRender(out *os.File, pkgTypes map[string]map[string]namedType) {
 	fmt.Fprintf(out, "digraph %q { \n", "GoERD")
 
+	// Build a flattened map of all types across all packages so that we can
+	// refer to types across services when connecting edges.
+	flatTypes := make(map[string]namedType)
+	for pkgName, types := range pkgTypes {
+		for typeName, ptype := range types {
+			flatTypes[typeName] = ptype
+			flatTypes[fmt.Sprintf("%s.%s", pkgName, typeName)] = ptype
+		}
+	}
+
 	var buf bytes.Buffer
 	for pkg, types := range pkgTypes {
 
-		fmt.Fprintf(out, "subgraph %q {\n", pkg)
+		fmt.Fprintf(out, "subgraph %q {\n", "cluster_"+pkg)
 		fmt.Fprintf(out, "label=%q;\n", pkg)
 
 		// Nodes
@@ -54,22 +83,22 @@ func dotRender(out *os.File, pkgTypes map[string]map[string]namedType) {
 			switch t := typ.Type.(type) {
 			case *ast.Ident:
 				var label = fmt.Sprintf(`%s %s`, typ.Ident.Name, t.Name)
-				fmt.Fprintf(out, " \"node-%s\" [shape=ellipse,label=\"%s\"];\n", typ.Ident.Name, escape(label))
+				fmt.Fprintf(out, " \"node-%s.%s\" [shape=ellipse,label=\"%s\"];\n", pkg, typ.Ident.Name, escape(label))
 			case *ast.SelectorExpr:
 				var label = fmt.Sprintf(`%s %s`, typ.Ident.Name, toString(t))
-				fmt.Fprintf(out, " \"node-%s\" [shape=ellipse,label=\"%s\"];\n", typ.Ident.Name, escape(label))
+				fmt.Fprintf(out, " \"node-%s.%s\" [shape=ellipse,label=\"%s\"];\n", pkg, typ.Ident.Name, escape(label))
 			case *ast.ChanType:
 				var label = fmt.Sprintf(`%s %s`, typ.Ident.Name, toString(t))
-				fmt.Fprintf(out, " \"node-%s\" [shape=box,label=\"%s\"];\n", typ.Ident.Name, escape(label))
+				fmt.Fprintf(out, " \"node-%s.%s\" [shape=box,label=\"%s\"];\n", pkg, typ.Ident.Name, escape(label))
 			case *ast.FuncType:
 				var label = fmt.Sprintf(`%s %s`, typ.Ident.Name, toString(t))
-				fmt.Fprintf(out, " \"node-%s\" [shape=rectangle,label=\"%s\"];\n", typ.Ident.Name, escape(label))
+				fmt.Fprintf(out, " \"node-%s.%s\" [shape=rectangle,label=\"%s\"];\n", pkg, typ.Ident.Name, escape(label))
 			case *ast.ArrayType:
 				var label = fmt.Sprintf(`%s %s`, typ.Ident.Name, toString(t))
-				fmt.Fprintf(out, " \"node-%s\" [shape=rectangle,label=\"%s\"];\n", typ.Ident.Name, escape(label))
+				fmt.Fprintf(out, " \"node-%s.%s\" [shape=rectangle,label=\"%s\"];\n", pkg, typ.Ident.Name, escape(label))
 			case *ast.MapType:
 				var label = fmt.Sprintf(`%s %s`, typ.Ident.Name, toString(t))
-				fmt.Fprintf(out, " \"node-%s\" [shape=rectangle,label=\"%s\"];\n", typ.Ident.Name, escape(label))
+				fmt.Fprintf(out, " \"node-%s.%s\" [shape=rectangle,label=\"%s\"];\n", pkg, typ.Ident.Name, escape(label))
 			case *ast.InterfaceType:
 				fmt.Fprintf(&buf, `%s interface|`, typ.Ident.Name)
 				for i, f := range t.Methods.List {
@@ -89,7 +118,7 @@ func dotRender(out *os.File, pkgTypes map[string]map[string]namedType) {
 					}
 					fmt.Fprintf(&buf, `%s`, toString(f.Type))
 				}
-				fmt.Fprintf(out, " \"node-%s\" [shape=Mrecord,label=\"{%s}\"];\n", typ.Ident.Name, escape(buf.String()))
+				fmt.Fprintf(out, " \"node-%s.%s\" [shape=Mrecord,label=\"{%s}\"];\n", pkg, typ.Ident.Name, escape(buf.String()))
 			case *ast.StructType:
 				fmt.Fprintf(&buf, `%s|`, typ.Ident.Name)
 				for i, f := range t.Fields.List {
@@ -109,11 +138,14 @@ func dotRender(out *os.File, pkgTypes map[string]map[string]namedType) {
 					}
 					fmt.Fprintf(&buf, `%s`, toString(f.Type))
 				}
-				fmt.Fprintf(out, " \"node-%s\" [shape=record,label=\"{%s}\"];\n", typ.Ident.Name, escape(buf.String()))
+				fmt.Fprintf(out, " \"node-%s.%s\" [shape=record,label=\"{%s}\"];\n", pkg, typ.Ident.Name, escape(buf.String()))
 			default:
 				fmt.Fprintf(os.Stderr, "MISSED: %s: %#v\n ", toString(t), typ)
 			}
 		}
+		fmt.Fprintf(out, "}\n")
+	}
+	for pkg, types := range pkgTypes {
 
 		// Edges
 		for _, ptype := range types {
@@ -121,36 +153,42 @@ func dotRender(out *os.File, pkgTypes map[string]map[string]namedType) {
 			// TODO: exhaustive switch
 			case *ast.FuncType:
 				for i, typ := range dependsOn(t) {
-					var from = fmt.Sprintf(`"node-%s":f%d`, ptype.Ident.Name, i)
+					var from = fmt.Sprintf(`"node-%s.%s":f%d`, pkg, ptype.Ident.Name, i)
 					var to = fmt.Sprintf("node-%s", typ)
-					if _, ok := types[typ]; ok {
+					if _, ok := flatTypes[typ]; ok {
 						fmt.Fprintf(out, "%s -> %q;\n", from, to)
 					}
 				}
 			case *ast.ChanType:
 				for i, typ := range dependsOn(t) {
-					var from = fmt.Sprintf(`"node-%s":f%d`, ptype.Ident.Name, i)
+					var from = fmt.Sprintf(`"node-%s.%s":f%d`, pkg, ptype.Ident.Name, i)
 					var to = fmt.Sprintf("node-%s", typ)
-					if _, ok := types[typ]; ok {
+					if _, ok := flatTypes[typ]; ok {
 						fmt.Fprintf(out, "%s -> %q;\n", from, to)
 					}
 				}
 			case *ast.InterfaceType:
 				for i, f := range t.Methods.List {
-					var from = fmt.Sprintf(`"node-%s":f%d`, ptype.Ident.Name, i)
-					for _, typ := range dependsOn(f.Type) {
-						var to = fmt.Sprintf("node-%s", typ)
-						if _, ok := types[typ]; ok {
+					var from = fmt.Sprintf(`"node-%s.%s":f%d`, pkg, ptype.Ident.Name, i)
+					for _, typ := range dedup(dependsOn(f.Type)) {
+						if _, ok := flatTypes[typ]; ok {
+							if !strings.Contains(typ, ".") {
+								typ = fmt.Sprintf("%s.%s", pkg, typ)
+							}
+							var to = fmt.Sprintf("node-%s", typ)
 							fmt.Fprintf(out, "%s -> %q;\n", from, to)
 						}
 					}
 				}
 			case *ast.StructType:
 				for i, f := range t.Fields.List {
-					var from = fmt.Sprintf(`"node-%s":f%d`, ptype.Ident.Name, i)
-					for _, typ := range dependsOn(f.Type) {
-						var to = fmt.Sprintf("node-%s", typ)
-						if _, ok := types[typ]; ok {
+					var from = fmt.Sprintf(`"node-%s.%s":f%d`, pkg, ptype.Ident.Name, i)
+					for _, typ := range dedup(dependsOn(f.Type)) {
+						if _, ok := flatTypes[typ]; ok {
+							if !strings.Contains(typ, ".") {
+								typ = fmt.Sprintf("%s.%s", pkg, typ)
+							}
+							var to = fmt.Sprintf("node-%s", typ)
 							fmt.Fprintf(out, "%s -> %q;\n", from, to)
 						}
 					}
@@ -158,7 +196,6 @@ func dotRender(out *os.File, pkgTypes map[string]map[string]namedType) {
 			}
 		}
 
-		fmt.Fprintf(out, "}\n")
 	}
 	fmt.Fprintf(out, "}\n\n")
 }
@@ -199,9 +236,9 @@ func inspectDir(path string) map[string]map[string]namedType {
 			})
 		}
 
-		// for n, _ := range pkg.Imports {
-		// 	inspectDir(n)
-		// }
+		for n, _ := range pkg.Imports {
+			inspectDir(n)
+		}
 	}
 
 	return types
@@ -331,4 +368,16 @@ func dependsOn(n interface{}) []string {
 	default:
 		return []string{fmt.Sprintf("%#v", n)}
 	}
+}
+
+func dedup(strs []string) []string {
+	x := map[string]int{}
+	for _, s := range strs {
+		x[s] = 1
+	}
+	rv := []string{}
+	for k, _ := range x {
+		rv = append(rv, k)
+	}
+	return rv
 }
